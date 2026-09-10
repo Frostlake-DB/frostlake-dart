@@ -1,0 +1,24 @@
+name: frostlake
+version: 0.1.0
+description: >-
+  Zero-dependency Dart driver for the Frostlake SQL engine, speaking its HTTP
+  protocol against a running DatabaseHttpServer.
+homepage: https://frostlake.dev
+repository: https://github.com/Frostlake-DB/frostlake-dart
+issue_tracker: https://github.com/Frostlake-DB/frostlake-dart/issues
+
+environment:
+  sdk: ^3.0.0
+
+# No runtime dependencies: the transport is dart:io's HttpClient and the JSON
+# layer is the driver's own, so the package pulls in nothing at all.
+dev_dependencies:
+  lints: ^6.0.0
+  test: ^1.24.0
+
+topics:
+  - frostlake
+  - snowflake
+  - sql
+  - database
+  - driver
