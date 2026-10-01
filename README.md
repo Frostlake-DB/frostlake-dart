@@ -312,7 +312,7 @@ JAVA_HOME=/path/to/jdk17 FROSTLAKE_CLASSPATH="<engine classes>;<dependency class
 
 Those drive a real engine over the driver's own HTTP path — DDL and DML, every type that can be
 bound and read back, transactions, session scope, and the transport failures — so nothing in
-them is mocked. Against engine 0.0.7 all 143 tests pass.
+them is mocked. Against engine 0.2.0 all 180 tests pass.
 
 `test/suites_test.dart` replays the engine's language-neutral test corpus — the `suites/*.json`
 of the testkit directory `FL_CORPUS` names — through the driver, against an engine booted from the

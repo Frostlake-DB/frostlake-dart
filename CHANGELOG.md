@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.0
 
 - A colon glued to a `?` reads a path off the bound value. `SELECT ?:a` was refused as mixing
   `?` and `:name` placeholders, whatever arguments came with it; a `?` now ends an operand as a
@@ -19,6 +19,7 @@
   transaction left open on it: best effort, at most five seconds, never an error. Engines before
   0.1.0 are sent neither the flag nor the `DELETE`, and keep the `idleLimit` re-scope, which the
   newer ones no longer need.
+- Requires a Frostlake engine 0.2.0 or newer.
 
 ## 0.1.0
 
