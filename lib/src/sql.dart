@@ -208,6 +208,65 @@ bool _namesObject(Iterable<String> words, List<String> want) {
   return false;
 }
 
+/// Whether one statement leaves behind state a fresh session would not have: a
+/// moved scope or a session setting (everything [changesSessionScope] spots),
+/// or a temporary object.
+///
+/// A session holding such state cannot be quietly swapped for a new one when
+/// the engine loses it: the statement would run somewhere its author did not
+/// intend.
+bool touchesSession(String statement) =>
+    _statementChangesScope(statement) || _createsTemporary(statement);
+
+/// The words that may sit between `CREATE` and the kind of object it makes.
+const List<String> _createModifiers = [
+  'OR', 'REPLACE', 'TRANSIENT', 'TEMPORARY', 'TEMP', 'VOLATILE', //
+  'LOCAL', 'GLOBAL', 'SECURE', 'IF', 'NOT', 'EXISTS', 'PUBLIC', 'PRIVATE',
+  'ICEBERG', 'DYNAMIC', 'HYBRID', 'EVENT', 'RECURSIVE', 'MATERIALIZED',
+  'EXTERNAL',
+];
+
+const List<String> _temporary = ['TEMPORARY', 'TEMP', 'VOLATILE'];
+
+/// `CREATE TEMPORARY TABLE`, `CREATE OR REPLACE TEMP STAGE` and the like: an
+/// object that lives exactly as long as the session.
+bool _createsTemporary(String statement) {
+  final words = leadingWords(statement, 16);
+  if (words.isEmpty || words.first != 'CREATE') return false;
+  for (final word in words.skip(1)) {
+    if (_temporary.contains(word)) return true;
+    if (!_createModifiers.contains(word)) return false;
+  }
+  return false;
+}
+
+/// What a statement does to the session's transaction.
+enum TransactionEffect {
+  /// `BEGIN` on its own (or with `TRANSACTION`, `WORK` or `NAME`), or
+  /// `START TRANSACTION`.
+  begins,
+
+  /// `COMMIT` or `ROLLBACK`.
+  ends,
+
+  /// Anything else.
+  none,
+}
+
+/// Whether one statement opens or ends a transaction.
+///
+/// `BEGIN` followed by a statement opens a Snowflake Scripting block rather
+/// than a transaction, so it has no effect of its own.
+TransactionEffect transactionEffect(String statement) =>
+    switch (leadingWords(statement, 2)) {
+      ['BEGIN'] ||
+      ['BEGIN', 'TRANSACTION' || 'WORK' || 'NAME'] ||
+      ['START', 'TRANSACTION'] =>
+        TransactionEffect.begins,
+      ['COMMIT' || 'ROLLBACK', ...] => TransactionEffect.ends,
+      _ => TransactionEffect.none,
+    };
+
 /// Up to [n] words from the start of a statement, upper-cased, skipping
 /// whitespace and comments and stopping at the first thing that is not a word.
 List<String> leadingWords(String statement, int n) {

@@ -44,5 +44,6 @@ export 'src/errors.dart'
         ConnectionException,
         FrostlakeException,
         QueryException,
+        SessionLostException,
         UsageException;
 export 'src/result.dart' show ColumnInfo, Result;

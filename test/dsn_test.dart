@@ -62,6 +62,15 @@ void main() {
       ]);
     });
 
+    test('folds plain DSN names the way unquoted SQL does', () {
+      expect(parseDsn('frostlake://h:1/it_scope_db?schema=s').useStatements(),
+          ['USE DATABASE "IT_SCOPE_DB"', 'USE SCHEMA "S"']);
+      expect(parseDsn('frostlake://h:1/select').useStatements(),
+          ['USE DATABASE "SELECT"']);
+      expect(parseDsn('frostlake://h:1/my-db').useStatements(),
+          ['USE DATABASE "my-db"']);
+    });
+
     test('names no scope when the DSN names none', () {
       expect(parseDsn('frostlake://h:1').useStatements(), isEmpty);
     });

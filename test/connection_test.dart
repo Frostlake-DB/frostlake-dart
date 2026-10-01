@@ -1,4 +1,5 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'dart:typed_data';
 
@@ -103,18 +104,56 @@ void main() {
       ]);
     });
 
-    test('DDL answers as an empty result rather than throwing', () async {
+    test('DDL answers without throwing, and not as an update', () async {
+      // Engines before 0.1.0 answer DDL with an empty result; 0.1.0 answers
+      // with a one-row status grid, as live does.
       final result = await conn.execute('CREATE TABLE ddl_only (a INTEGER)');
-      expect(result.rows, isEmpty);
-      expect(result.value, isNull);
+      expect(result.isUpdate, isFalse);
+      expect(result.rows.length, lessThanOrEqualTo(1));
+      expect(result.value, anyOf(isNull, isA<String>()));
     });
 
     test('answers a multi-statement request with one result each', () async {
+      // A pack has to be asked for, as the account requires; 0 means any number.
+      await conn.execute('ALTER SESSION SET MULTI_STATEMENT_COUNT = 0');
       final results = await conn.executeAll('SELECT 1; SELECT 2; SELECT 3');
       expect(results, hasLength(3));
       expect(results.map((r) => r.value), [1, 2, 3]);
       // execute() hands back the first of them.
       expect((await conn.execute('SELECT 1; SELECT 2')).value, 1);
+    });
+
+    test('a pack declares its own count, with no ALTER SESSION anywhere',
+        () async {
+      // setUp gives every test its own connection, so this session's
+      // MULTI_STATEMENT_COUNT is the default 1 and the request itself is the
+      // only thing that can have let the pack through.
+      final results = await conn
+          .executeAllDeclaring('SELECT 1; SELECT 2', multiStatementCount: 2);
+      expect(results.map((r) => r.value), [1, 2]);
+
+      // 0 is how a pack asks for any number.
+      expect(
+          await conn.executeAllDeclaring('SELECT 1; SELECT 2; SELECT 3',
+              multiStatementCount: 0),
+          hasLength(3));
+
+      // The count did not stay behind: nothing was altered, so there is
+      // nothing to put back.
+      //
+      // Only an engine that counts the statements in a request refuses a pack
+      // at all, and this driver supports older ones than that. Against one of
+      // those the refusal never comes, so the check is SKIPPED rather than
+      // passed: a green tick would claim an engine had been checked for a
+      // refusal it does not make.
+      try {
+        await conn.executeAll('SELECT 1; SELECT 2');
+        markTestSkipped('this engine accepts a pack nobody asked for, so it '
+            'has no refusal to assert');
+      } on QueryException {
+        // Refused, as an engine with the gate does: the session is where it
+        // was left.
+      }
     });
 
     group('parameters', () {
@@ -131,6 +170,15 @@ void main() {
             'SELECT :a + :b AS total, :a AS again', {'a': 2, 'B': 40});
         expect(result.rows.first['TOTAL'], 42);
         expect(result.rows.first['AGAIN'], 2);
+      });
+
+      test('a path off a bound value reads its field', () async {
+        // The colon glued to the ? reads a path rather than opening a :name
+        // marker, so the statement is not refused for mixing the two styles.
+        final result = await conn.execute('SELECT ?:a::INTEGER AS a', [
+          {'a': 42},
+        ]);
+        expect(result.value, 42);
       });
 
       test('a value cannot become syntax', () async {
@@ -212,9 +260,33 @@ void main() {
 
       test('a timestamp keeps the instant it named', () async {
         final instant = DateTime.utc(2024, 3, 4, 5, 6, 7, 890);
-        final read = (await roundTrip('TIMESTAMP_NTZ', instant))! as DateTime;
+        // A bound DateTime is a TIMESTAMP_TZ, which a TIMESTAMP_TZ column
+        // keeps as it is.
+        final read = (await roundTrip('TIMESTAMP_TZ', instant))! as DateTime;
         // A DateTime carries its zone flag into ==, so the instant is what to
         // compare on.
+        expect(read.isAtSameMomentAs(instant), isTrue,
+            reason: 'read $read, bound $instant');
+      });
+
+      test('a timestamp reaches an NTZ column through a cast', () async {
+        final instant = DateTime.utc(2024, 3, 4, 5, 6, 7, 890);
+        await conn.execute('CREATE OR REPLACE TABLE rt (v TIMESTAMP_NTZ)');
+        // The account refuses a TIMESTAMP_TZ written into a TIMESTAMP_NTZ
+        // column while compiling, so a bare bound DateTime is refused too.
+        await expectLater(
+            conn.execute('INSERT INTO rt VALUES (?)', [instant]),
+            throwsA(isA<QueryException>().having(
+                (e) => e.message,
+                'message',
+                contains(
+                    'expecting TIMESTAMP_NTZ(9) but got TIMESTAMP_TZ(9)'))));
+        // Cast, it keeps the wall clock the DateTime was written with, which
+        // for a UTC DateTime is the instant an NTZ reads back as.
+        await conn.execute(
+            'INSERT INTO rt VALUES (CAST(? AS TIMESTAMP_NTZ))', [instant]);
+        final read =
+            (await conn.execute('SELECT v FROM rt')).value! as DateTime;
         expect(read.isAtSameMomentAs(instant), isTrue,
             reason: 'read $read, bound $instant');
       });
@@ -242,6 +314,30 @@ void main() {
         expect(number.precision, 10);
         expect(number.scale, 2);
         expect(number.nullable, isNotNull);
+      });
+
+      test('reports the declared length of text and binary columns', () async {
+        // Characters for text, bytes for binary, the type's maximum when the
+        // column is unbounded. Nothing else carries one, and an absent length
+        // stays null rather than reading back as a width of 0.
+        await conn.execute('CREATE OR REPLACE TABLE widths '
+            '(s VARCHAR(9), b BINARY(5), big VARCHAR, n NUMBER(10,2))');
+        final result = await conn.execute('SELECT s, b, big, n FROM widths');
+        // Engines before 0.1.0 send no length at all, and this driver supports
+        // them: a column then reports none, and there is no width to check.
+        // SKIPPED rather than passed — a green tick would claim an engine had
+        // been checked for a width it never sends.
+        if (result.columns[0].length == null) {
+          markTestSkipped('this engine sends no column length, so there are '
+              'no declared widths to check');
+        } else {
+          expect(result.columns[0].length, 9);
+          expect(result.columns[1].length, 5);
+          expect(result.columns[2].length, 16777216);
+        }
+        // A number carries no length on either engine.
+        expect(result.columns[3].length, isNull);
+        await conn.execute('DROP TABLE widths');
       });
     });
 
@@ -401,6 +497,96 @@ void main() {
       });
     });
   }, skip: TestServer.skipReason);
+
+  group('the statement count a request declares', () {
+    // A stub rather than an engine: these cases are about what the driver PUT
+    // ON THE WIRE, so the answers are the least an engine could send.
+    Future<void> withRecorder(
+        Future<void> Function(Connection conn, List<String> bodies) body) async {
+      final bodies = <String>[];
+      final stub = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+      unawaited(stub.forEach((request) async {
+        final sent = await utf8.decoder.bind(request).join();
+        if (request.uri.path == '/api/health') {
+          request.response.write('{"status":"healthy"}');
+        } else {
+          bodies.add(sent);
+          request.response
+              .write('{"success":true,"sessionId":"s-1","resultSets":[]}');
+        }
+        await request.response.close();
+      }));
+      try {
+        final conn = await connect('frostlake://127.0.0.1:${stub.port}');
+        try {
+          await body(conn, bodies);
+        } finally {
+          await conn.close();
+        }
+      } finally {
+        await stub.close(force: true);
+      }
+    }
+
+    test('is absent unless the caller asked for one', () async {
+      await withRecorder((conn, bodies) async {
+        // The field is left out entirely, not sent as 0 or null: a request
+        // without it is the one the engine has always seen, and the session's
+        // MULTI_STATEMENT_COUNT decides.
+        await conn.execute('SELECT 1');
+        expect(bodies.last, isNot(contains('multiStatementCount')));
+        await conn.executeAllNamed('SELECT :a', {'a': 1});
+        expect(bodies.last, isNot(contains('multiStatementCount')));
+      });
+    });
+
+    test('rides on that one request, and alters nothing', () async {
+      await withRecorder((conn, bodies) async {
+        await conn.executeAllDeclaring('SELECT 1; SELECT 2',
+            multiStatementCount: 2);
+        expect(bodies.last, contains('"multiStatementCount":2'));
+
+        // 0 is a count like any other, and goes out as one.
+        await conn.executeAllDeclaring('SELECT 1; SELECT 2; SELECT 3',
+            multiStatementCount: 0);
+        expect(bodies.last, contains('"multiStatementCount":0'));
+
+        // It declared that one request only, and nothing was altered to make
+        // it work: there is no ALTER SESSION to send and none to undo.
+        await conn.execute('SELECT 4');
+        expect(bodies.last, isNot(contains('multiStatementCount')));
+        expect(bodies.join(), isNot(contains('ALTER SESSION')));
+      });
+    });
+
+    test('carries either placeholder style, and not both', () async {
+      await withRecorder((conn, bodies) async {
+        await conn.executeAllDeclaring('SELECT ?',
+            parameters: [1], multiStatementCount: 1);
+        expect(bodies.last, contains('"multiStatementCount":1'));
+        expect(bodies.last, contains('SELECT 1'));
+
+        await conn.executeAllDeclaring('SELECT :a',
+            namedParameters: {'a': 2}, multiStatementCount: 1);
+        expect(bodies.last, contains('"multiStatementCount":1'));
+        expect(bodies.last, contains('SELECT 2'));
+
+        await expectLater(
+            conn.executeAllDeclaring('SELECT ?',
+                parameters: [1], namedParameters: {'a': 2}),
+            throwsA(isA<UsageException>()));
+      });
+    });
+
+    test('a count that is not a whole number of statements is refused',
+        () async {
+      await withRecorder((conn, bodies) async {
+        await expectLater(
+            conn.executeAllDeclaring('SELECT 1', multiStatementCount: -1),
+            throwsA(isA<UsageException>()));
+      });
+    });
+  });
 
   group('transport failures', () {
     test('a refused connection is a ConnectionException', () async {

@@ -9,7 +9,8 @@ const Duration defaultConnectTimeout = Duration(seconds: 10);
 const Duration defaultRequestTimeout = Duration(minutes: 5);
 
 /// The engine reclaims a session after 30 minutes idle. Past that the driver
-/// has to assume its own is gone, because nothing in a response says so.
+/// has to assume its own is gone when the engine predates 0.1.0, because
+/// nothing in such an engine's response says so.
 const Duration defaultSessionIdleLimit = Duration(minutes: 30);
 
 /// Everything the DSN query string may carry. Anything else is a typo, and a
@@ -59,6 +60,9 @@ class Config {
 
   /// How long a connection may sit idle before the driver stops trusting that
   /// its engine session survived. [Duration.zero] switches the check off.
+  ///
+  /// Only an engine before 0.1.0 needs the check: a newer one refuses a
+  /// session it no longer holds, and the driver replaces it then.
   final Duration idleLimit;
 
   /// The base URL of the server, without a trailing slash. An IPv6 literal
@@ -72,10 +76,10 @@ class Config {
   /// dependency order. Rebuilt on demand, so a session that may have lapsed can
   /// be put back on this scope.
   List<String> useStatements() => [
-        if (role != null) 'USE ROLE ${quoteIdentifier(role!)}',
-        if (warehouse != null) 'USE WAREHOUSE ${quoteIdentifier(warehouse!)}',
-        if (database != null) 'USE DATABASE ${quoteIdentifier(database!)}',
-        if (schema != null) 'USE SCHEMA ${quoteIdentifier(schema!)}',
+        if (role != null) 'USE ROLE ${_useIdentifier(role!)}',
+        if (warehouse != null) 'USE WAREHOUSE ${_useIdentifier(warehouse!)}',
+        if (database != null) 'USE DATABASE ${_useIdentifier(database!)}',
+        if (schema != null) 'USE SCHEMA ${_useIdentifier(schema!)}',
       ];
 }
 
@@ -93,6 +97,16 @@ String quoteIdentifier(String name) {
   }
   return '"${name.replaceAll('"', '""')}"';
 }
+
+/// A DSN name as a `USE` statement needs it. A plain name means what it means
+/// unquoted in SQL — the upper-case object it folds to — so it is folded before
+/// it is quoted; anything else is quoted exactly as given. Quoted as given, a
+/// lower-case name would ask for a lower-case object, which `USE` refuses: it
+/// resolves names exactly, as live does.
+String _useIdentifier(String name) => quoteIdentifier(
+    _plainIdentifier.hasMatch(name) ? name.toUpperCase() : name);
+
+final _plainIdentifier = RegExp(r'^[A-Za-z_][A-Za-z0-9_$]*$');
 
 /// Parses a DSN of the form
 /// `frostlake://host[:port][/DATABASE][?param=value&...]`.

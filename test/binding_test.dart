@@ -98,9 +98,27 @@ void main() {
         'SELECT "V":k FROM t',
         "SELECT {'a': 1}:a",
         'SELECT arr[0]:k FROM t',
+        "SELECT '{}':k",
+        r'SELECT $1:k FROM t',
       ]) {
         expect(placeholderNames(sql), isEmpty, reason: sql);
       }
+    });
+
+    test('a path off a ? is not a parameter', () {
+      // A ? ends an operand just as a name or a closing bracket does, so a
+      // colon glued to it reads a field of the bound value...
+      expect(placeholderNames('SELECT ?:a'), isEmpty);
+      expect(placeholderCount('SELECT ?:a'), 1);
+      expect(substitutePositional('SELECT ?:a', [1]), 'SELECT 1:a');
+      expect(
+          substitutePositional('SELECT ?:a::INTEGER', [
+            {'a': 1},
+          ]),
+          "SELECT {'a': 1}:a::INTEGER");
+      // ...while one spaced off it opens a :name marker, as after any operand.
+      expect(placeholderNames('SELECT ? :a'), ['A']);
+      expect(placeholderNames('SELECT v :a FROM t'), ['A']);
     });
 
     test('a bind marker after an operator or comma is a parameter', () {

@@ -8,6 +8,7 @@ class ColumnInfo {
     this.nullable,
     this.precision,
     this.scale,
+    this.length,
   });
 
   /// The column's name, as the engine cased it.
@@ -25,6 +26,14 @@ class ColumnInfo {
 
   /// Decimal scale, for the fixed-point numeric types.
   final int? scale;
+
+  /// The declared width of a text (characters) or binary (bytes) column — the
+  /// type's maximum when the column is unbounded. The account reports this one
+  /// number as both the column's precision and its display size.
+  ///
+  /// `null` for every other type, and for an engine that predates the field:
+  /// unknown rather than a width of 0.
+  final int? length;
 
   @override
   String toString() => '$name $dataType';

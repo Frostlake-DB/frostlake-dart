@@ -4,8 +4,9 @@
 ///
 /// The split is the one a caller actually branches on: did the engine refuse
 /// the statement ([QueryException]), did the request never become an answer
-/// ([ConnectionException]), or did the driver never send it in the first place
-/// ([UsageException])?
+/// ([ConnectionException]), did the session it belonged to go away before it
+/// ran ([SessionLostException]), or did the driver never send it in the first
+/// place ([UsageException])?
 sealed class FrostlakeException implements Exception {
   const FrostlakeException(this.message);
 
@@ -60,6 +61,30 @@ class QueryException extends FrostlakeException {
 
   @override
   String toString() => 'QueryException: $message';
+}
+
+/// The engine no longer holds the connection's session — it expired, was
+/// released, or the server restarted — and the statement did **not** run.
+///
+/// A lost session is replaced without a word when nothing went with it: the
+/// DSN's scope goes onto a fresh session and the statement is sent once more.
+/// This is raised instead when the lost session held something a fresh one
+/// cannot reproduce — an open transaction, or context set up with `USE`, `SET`,
+/// `ALTER SESSION` or a temporary object — because re-running the statement
+/// would put it somewhere its author did not intend.
+///
+/// The connection stays usable: the next statement starts a fresh session on
+/// the DSN's scope. Whatever the unit of work had done in the lost session is
+/// gone, so it is the unit of work that has to start over.
+class SessionLostException extends FrostlakeException {
+  const SessionLostException(super.message, {required this.statement});
+
+  /// The SQL that did not run, **after client-side parameter substitution** —
+  /// sensitive for the same reason as [QueryException.statement].
+  final String statement;
+
+  @override
+  String toString() => 'SessionLostException: $message';
 }
 
 /// The driver was asked for something impossible, and never sent a request: a

@@ -61,10 +61,11 @@ List<Placeholder> scanPlaceholders(String sql) {
         continue;
       }
     }
-    // A colon ADJACENT to the end of an expression — an identifier character,
-    // `)`, `]`, `}`, `"` or `'` — is Snowflake's VARIANT path access (`v:field`,
-    // `PARSE_JSON('...'):k`, `{'a': 1}:a`, `"V":k`), not a parameter: a bind
-    // marker follows an operator, comma or keyword boundary instead.
+    // A colon ADJACENT to the end of an operand — an identifier character,
+    // `)`, `]`, `}`, `"`, `'` or a `?` placeholder — is Snowflake's VARIANT
+    // path access (`v:field`, `PARSE_JSON('...'):k`, `{'a': 1}:a`, `"V":k`,
+    // `?:k`), not a parameter: a bind marker follows an operator, comma or
+    // keyword boundary instead.
     if (i > 0) {
       final prev = sql.codeUnitAt(i - 1);
       if (isWordChar(prev) ||
@@ -72,7 +73,8 @@ List<Placeholder> scanPlaceholders(String sql) {
           prev == _rbracket ||
           prev == _rbrace ||
           prev == _doubleQuote ||
-          prev == _apostrophe) {
+          prev == _apostrophe ||
+          prev == _question) {
         i++;
         continue;
       }

@@ -13,6 +13,9 @@ import 'values.dart';
 /// How much of an unrecognisable response is quoted back in an error.
 const int _maxErrorBody = 512;
 
+/// The longest [Connection.close] waits for the engine to release a session.
+const Duration _releaseLimit = Duration(seconds: 5);
+
 /// Opens a connection to a Frostlake HTTP server.
 ///
 /// ```dart
@@ -70,6 +73,12 @@ Future<Connection> connect(
 /// and stays on one session — session state (`USE`, variables, an open
 /// transaction) carries from one statement to the next, which is exactly what a
 /// half-interleaved second statement would break.
+///
+/// The engine can lose the session: it expires after 30 idle minutes, and a
+/// restart ends them all. A statement that finds its session gone is sent once
+/// more on a fresh session with the DSN's scope, unless the lost session held
+/// an open transaction or context of the caller's own — then it raises
+/// [SessionLostException] instead. [close] releases the session.
 class Connection {
   Connection._(this._config, SecurityContext? context, bool? verifyCertificate)
       : _client = HttpClient(context: context) {
@@ -105,6 +114,20 @@ class Connection {
   /// Whether the caller has selected a scope themselves; if they have, the
   /// DSN's defaults are no longer the whole truth about this session.
   bool _sessionTouched = false;
+
+  /// Whether the engine reports `newSession` — which arrived together with
+  /// `requireSession` and `DELETE /api/sessions/{id}` — or `null` until the
+  /// first answer that names a session settles it.
+  bool? _tracksSessions;
+
+  /// Set once a statement left state behind that a fresh session would not
+  /// have (see [touchesSession]); cleared when the DSN's scope goes back on.
+  bool _dirty = false;
+
+  /// Whether a transaction is open on the session: set by a `BEGIN` or `START
+  /// TRANSACTION` that succeeded, cleared by a `COMMIT` or `ROLLBACK`, however
+  /// each was sent.
+  bool _inTransaction = false;
 
   /// The engine's id for this connection's session, once it has one.
   String? get sessionId => _sessionId;
@@ -158,24 +181,157 @@ class Connection {
           String sql, Map<String, Object?> parameters) async =>
       _run(sql, substituteNamed(sql, parameters));
 
-  Future<List<Result>> _run(String sql, String rendered) {
+  /// Runs a statement string that says how many statements it holds, and
+  /// returns every result set it produced, in order.
+  ///
+  /// The engine refuses a request holding more statements than it was told to
+  /// expect, so a pack says how many it holds:
+  ///
+  /// ```dart
+  /// await conn.executeAllDeclaring('SELECT 1; SELECT 2', multiStatementCount: 2);
+  /// ```
+  ///
+  /// [multiStatementCount] travels with this one request. It outranks the
+  /// session's `MULTI_STATEMENT_COUNT` without changing it, so there is nothing
+  /// to put back afterwards, and `0` allows any number. Left out, no count is
+  /// sent at all and the session's value decides, exactly as it does for every
+  /// other method here.
+  ///
+  /// [parameters] fill positional `?` markers and [namedParameters] fill
+  /// `:name` ones, as they do for [executeAll] and [executeAllNamed]; at most
+  /// one of the two. They are named here because Dart allows named arguments
+  /// only on a signature with no optional positional ones — which is also why
+  /// the count lives on a method of its own rather than on [executeAll].
+  Future<List<Result>> executeAllDeclaring(
+    String sql, {
+    int? multiStatementCount,
+    List<Object?> parameters = const [],
+    Map<String, Object?>? namedParameters,
+  }) async {
+    if (parameters.isNotEmpty && namedParameters != null) {
+      throw const UsageException('give parameters or namedParameters, not both: '
+          'a statement carries one placeholder style');
+    }
+    final rendered = namedParameters == null
+        ? substitutePositional(sql, parameters)
+        : substituteNamed(sql, namedParameters);
+    return _run(sql, rendered, _statementCount(multiStatementCount));
+  }
+
+  Future<List<Result>> _run(String sql, String rendered,
+      [int? multiStatementCount]) {
     _checkOpen();
     // The pending USE statements and the statement itself have to reach the
     // session as one unit: another caller must not slip a query in between, and
     // two must not both try to send the same pending entry.
     return _serialize(() async {
       _restoreSessionDefaults();
-      while (_pendingUse.isNotEmpty) {
-        // Each USE leaves the queue only once it has succeeded. A DSN naming a
-        // database that does not exist has to keep failing; the alternative is
-        // later statements quietly running in the default scope.
-        await _roundTrip(_pendingUse.first);
-        _pendingUse.removeAt(0);
-      }
-      final body = await _roundTrip(rendered);
+      final body = await _statement(rendered,
+          multiStatementCount: multiStatementCount, scoped: true);
       if (changesSessionScope(sql)) _sessionTouched = true;
+      _track(sql);
       return _shapeResults(body);
     });
+  }
+
+  /// Sends one statement of the caller's — after the pending DSN scope when
+  /// [scoped] — and replaces a session the engine no longer holds.
+  ///
+  /// The engine answers 404 to a request that requires a session it does not
+  /// have, and runs nothing. When the lost session held nothing a fresh one
+  /// could not reproduce, the DSN's scope goes onto a fresh session and the
+  /// statement is sent once more; otherwise [_loseSession] raises.
+  Future<Map<String, Object?>> _statement(String sql,
+      {int? multiStatementCount, bool? autoCommit, bool scoped = false}) async {
+    final answer =
+        await _unit(sql, multiStatementCount, autoCommit, scoped: scoped);
+    if (answer != null) return answer;
+    _loseSession(sql);
+    final again =
+        await _unit(sql, multiStatementCount, autoCommit, scoped: true);
+    if (again != null) return again;
+    _sessionId = null;
+    _startOver();
+    throw SessionLostException(
+        'the engine refused a session it had just started',
+        statement: sql);
+  }
+
+  /// The pending DSN scope when [scoped], then [sql]: `null` when the engine
+  /// refused the session as unknown on any of them, so that neither that
+  /// request nor anything after it ran.
+  Future<Map<String, Object?>?> _unit(
+      String sql, int? multiStatementCount, bool? autoCommit,
+      {required bool scoped}) async {
+    if (scoped && !await _drainScope()) return null;
+    return _roundTrip(sql, multiStatementCount, autoCommit);
+  }
+
+  /// Sends the pending `USE` statements; `false` when the engine refused the
+  /// session as unknown.
+  Future<bool> _drainScope() async {
+    while (_pendingUse.isNotEmpty) {
+      // Each USE leaves the queue only once it has succeeded. A DSN naming a
+      // database that does not exist has to keep failing; the alternative is
+      // later statements quietly running in the default scope. Each is one
+      // statement of its own, whatever the request behind it declares.
+      final queue = _pendingUse;
+      if (await _roundTrip(queue.first) == null) return false;
+      // An answer saying the engine replaced the session queued the whole
+      // scope afresh, and that queue starts from the top.
+      if (identical(queue, _pendingUse)) queue.removeAt(0);
+    }
+    return true;
+  }
+
+  /// The engine no longer holds the session — it expired, was released, or
+  /// the server restarted — and nothing ran. The next request starts a fresh
+  /// session on the DSN's scope.
+  ///
+  /// With an open transaction or a moved context gone with it, re-running the
+  /// statement would put it somewhere its author did not intend, so that is
+  /// refused here rather than done.
+  void _loseSession(String sql) {
+    final hadTransaction = _inTransaction || !_autoCommit;
+    final hadContext = _dirty;
+    _sessionId = null;
+    _startOver();
+    if (hadTransaction) {
+      _autoCommit = true;
+      throw SessionLostException(
+          "the engine no longer holds this connection's session (it expired, "
+          'was released, or the server restarted), so its open transaction is '
+          'gone; the statement did not run',
+          statement: sql);
+    }
+    if (hadContext) {
+      throw SessionLostException(
+          "the engine no longer holds this connection's session (it expired, "
+          'was released, or the server restarted), and the context set up on '
+          'it (USE, SET, ALTER SESSION or a temporary object) went with it, so '
+          'the statement was not re-run; the next statement starts a fresh '
+          "session on the connection's scope",
+          statement: sql);
+    }
+  }
+
+  /// Forgets what the session held: the one the next statement meets is fresh,
+  /// and gets the DSN's scope first.
+  void _startOver() {
+    _dirty = false;
+    _inTransaction = false;
+    _sessionTouched = false;
+    _pendingUse = [..._sessionDefaults];
+  }
+
+  /// Follows what a statement that succeeded did to the session.
+  void _track(String sql) {
+    for (final statement in splitStatements(sql)) {
+      if (touchesSession(statement)) _dirty = true;
+      final effect = transactionEffect(statement);
+      if (effect == TransactionEffect.begins) _inTransaction = true;
+      if (effect == TransactionEffect.ends) _inTransaction = false;
+    }
   }
 
   /// Selects the database, schema, role and warehouse the DSN names.
@@ -190,10 +346,19 @@ class Connection {
       // without this a second call would send nothing and report success.
       _pendingUse = [..._sessionDefaults];
       _sessionTouched = false;
-      while (_pendingUse.isNotEmpty) {
-        await _roundTrip(_pendingUse.first);
-        _pendingUse.removeAt(0);
+      if (!await _drainScope()) {
+        // The refused USE is still at the head of the queue.
+        final refused = _pendingUse.first;
+        _loseSession(refused);
+        if (!await _drainScope()) {
+          _sessionId = null;
+          _startOver();
+          throw SessionLostException(
+              'the engine refused a session it had just started',
+              statement: refused);
+        }
       }
+      _dirty = false;
     });
   }
 
@@ -243,13 +408,11 @@ class Connection {
   Future<void> begin() async {
     _checkOpen();
     await _serialize(() async {
+      // BEGIN travels with autocommit off, the mode the transaction runs in;
+      // the connection takes that mode on only once BEGIN has succeeded.
+      await _statement('BEGIN', autoCommit: false);
       _autoCommit = false;
-      try {
-        await _roundTrip('BEGIN');
-      } on Object {
-        _autoCommit = true;
-        rethrow;
-      }
+      _track('BEGIN');
     });
   }
 
@@ -258,7 +421,8 @@ class Connection {
     _checkOpen();
     await _serialize(() async {
       try {
-        await _roundTrip('COMMIT');
+        await _statement('COMMIT');
+        _track('COMMIT');
       } finally {
         _autoCommit = true;
       }
@@ -270,9 +434,10 @@ class Connection {
     _checkOpen();
     await _serialize(() async {
       try {
-        await _roundTrip('ROLLBACK');
+        await _statement('ROLLBACK');
       } finally {
         _autoCommit = true;
+        _inTransaction = false;
       }
     });
   }
@@ -301,12 +466,18 @@ class Connection {
     return result;
   }
 
-  /// Closes the connection.
+  /// Closes the connection, releasing the engine session behind it.
   ///
-  /// The HTTP API has no endpoint for ending a session, so the engine's own
-  /// idle sweep is what reclaims the session behind it; closing frees the
-  /// client's sockets, and lets the next statement on this object fail loudly
-  /// rather than quietly opening a second session.
+  /// The release is one `DELETE /api/sessions/{id}`, which also rolls back a
+  /// transaction left open on the session. It is a courtesy: bounded to five
+  /// seconds (less when the DSN's `timeout` is shorter), and a release that
+  /// fails or never answers is not an error — the engine expires the session
+  /// on its own. An engine before 0.1.0 has no such endpoint and is sent
+  /// nothing; its session lingers until that expiry, as it always did.
+  ///
+  /// Closing frees the client's sockets, and lets the next statement on this
+  /// object fail loudly rather than quietly opening a second session. Closing
+  /// again does nothing.
   Future<void> close() async {
     if (_closed) return;
     _closed = true;
@@ -317,7 +488,39 @@ class Connection {
     } on Object {
       // Its own caller is the one who hears about that failure.
     }
+    await _release();
     _client.close(force: true);
+  }
+
+  /// Sends the `DELETE` that ends the session, when there is one to end and
+  /// the engine is known to have the endpoint. Never throws.
+  Future<void> _release() async {
+    final id = _sessionId;
+    _sessionId = null;
+    _inTransaction = false;
+    if (id == null || _tracksSessions != true) return;
+    final endpoint =
+        '${_config.baseUrl}/api/sessions/${Uri.encodeComponent(id)}';
+    final timeout = _config.timeout;
+    final limit = timeout == Duration.zero || timeout > _releaseLimit
+        ? _releaseLimit
+        : timeout;
+    final inFlight = _InFlight();
+    Future<void> send() async {
+      final request = await _client.deleteUrl(Uri.parse(endpoint));
+      inFlight.request = request;
+      final response = await request.close();
+      await response.drain<void>();
+    }
+
+    try {
+      await send().timeout(limit,
+          onTimeout: () => inFlight.abort(TimeoutException(
+              '$endpoint did not answer within ${_describe(limit)}', limit)));
+    } on Object {
+      // Whatever became of it, the connection is closed: a session the engine
+      // did not release expires on its own.
+    }
   }
 
   void _checkOpen() {
@@ -331,15 +534,20 @@ class Connection {
     return previous.then((_) => action()).whenComplete(gate.complete);
   }
 
-  /// The engine reclaims a session once it has been idle long enough, then
-  /// quietly builds a fresh one for the id we keep sending — losing the scope we
-  /// selected. Nothing in the reply gives it away: the id we sent is echoed back
-  /// either way. So past the limit the only safe reading is that the session is
-  /// new, and the DSN's defaults go back on.
+  /// An engine before 0.1.0 reclaims a session once it has been idle long
+  /// enough, then quietly builds a fresh one for the id we keep sending —
+  /// losing the scope we selected. Nothing in the reply gives it away: the id
+  /// we sent is echoed back either way. So past the limit the only safe reading
+  /// is that the session is new, and the DSN's defaults go back on.
   ///
   /// Not once the caller has selected a scope themselves: putting our defaults
   /// over their choice is its own surprise.
+  ///
+  /// An engine that reports `newSession` needs no clock: the connection
+  /// requires its session, so a lost one is refused rather than rebuilt, and
+  /// the statement that finds it gone puts the scope back (see [_statement]).
   void _restoreSessionDefaults() {
+    if (_tracksSessions != false) return;
     if (_sessionDefaults.isEmpty || _sessionTouched) return;
     if (_config.idleLimit == Duration.zero) return;
     final last = _lastUsedAt;
@@ -348,12 +556,27 @@ class Connection {
     _pendingUse = [..._sessionDefaults];
   }
 
-  Future<Map<String, Object?>> _roundTrip(String sql) async {
+  /// One `POST /api/execute`, with no recovery: the decoded answer, or `null`
+  /// when the engine refused the session as unknown and ran nothing.
+  Future<Map<String, Object?>?> _roundTrip(String sql,
+      [int? multiStatementCount, bool? autoCommit]) async {
     final endpoint = '${_config.baseUrl}/api/execute';
+    final id = _sessionId;
+    // Resume this session or refuse: without the flag, an engine that no
+    // longer holds the session starts a fresh one under the same id, at its
+    // default scope, and runs the statement there. Only an engine known to
+    // read the flag is sent it; an older one's parser need not accept a field
+    // it does not know.
+    final requireSession = id != null && _tracksSessions == true;
     final payload = encodeJson(<String, Object?>{
       'sql': sql,
-      if (_sessionId != null) 'sessionId': _sessionId,
-      'autoCommit': _autoCommit,
+      if (id != null) 'sessionId': id,
+      if (requireSession) 'requireSession': true,
+      'autoCommit': autoCommit ?? _autoCommit,
+      // Absent unless the caller asked for a count: a request without the field
+      // is the one the server has always seen, and the session's value decides.
+      if (multiStatementCount != null)
+        'multiStatementCount': multiStatementCount,
     });
 
     final inFlight = _InFlight();
@@ -369,8 +592,16 @@ class Connection {
 
     final decoded = _decodeBody(endpoint, answer);
 
-    final session = decoded['sessionId'];
-    if (session is String && session.isNotEmpty) _sessionId = session;
+    // The one answer that names no session for a request that required one:
+    // the session is gone, and nothing ran.
+    if (answer.status == HttpStatus.notFound &&
+        requireSession &&
+        decoded['success'] != true &&
+        decoded['sessionId'] == null) {
+      return null;
+    }
+
+    _absorbSession(decoded, sentId: id != null);
 
     if (decoded['success'] != true) {
       throw QueryException(_failureMessage(decoded, answer),
@@ -378,6 +609,24 @@ class Connection {
     }
     _lastUsedAt = _clock.elapsed;
     return decoded;
+  }
+
+  /// Keeps the session an answer names, and learns from it whether the engine
+  /// tracks sessions: a `newSession` field, true or false, says it does.
+  void _absorbSession(Map<String, Object?> decoded, {required bool sentId}) {
+    final session = decoded['sessionId'];
+    if (session is! String || session.isEmpty) return;
+    _sessionId = session;
+    final started = decoded['newSession'];
+    if (started is bool) {
+      _tracksSessions = true;
+      // The engine ran the statement in a fresh session in place of ours:
+      // whatever the old one held is gone, and the DSN's scope goes back on
+      // before the next statement.
+      if (started && sentId) _startOver();
+    } else {
+      _tracksSessions ??= false;
+    }
   }
 
   Future<T> _withTimeout<T>(Future<T> Function() action, String endpoint,
@@ -470,6 +719,7 @@ class Connection {
               column['nullable'] is bool ? column['nullable']! as bool : null,
           precision: _asInt(column['precision']),
           scale: _asInt(column['scale']),
+          length: _asInt(column['length']),
         ));
       }
     }
@@ -533,6 +783,17 @@ class _Answer {
 
   final int status;
   final String body;
+}
+
+/// The statement count a call declares, checked here so a bad value is a usage
+/// error rather than a request body the engine cannot read.
+int? _statementCount(int? given) {
+  if (given == null) return null;
+  if (given < 0) {
+    throw UsageException('multiStatementCount is a whole number of statements, '
+        '0 for any number, not $given');
+  }
+  return given;
 }
 
 String? _asString(Object? value) => value is String ? value : null;
