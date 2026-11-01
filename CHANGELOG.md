@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1
+
+- A name is read whole, so the `$$` in `a$$b` opens no body, and a line comment ends at a carriage
+  return as well as a line feed, as the engine's lexer reads them. A `?`, a `USE` or a `BEGIN`
+  behind either is now seen.
+
 ## 0.2.0
 
 - A colon glued to a `?` reads a path off the bound value. `SELECT ?:a` was refused as mixing

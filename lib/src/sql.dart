@@ -33,6 +33,12 @@ bool isWordChar(int c) =>
     (c >= _upperA && c <= _upperZ) ||
     (c >= _zero && c <= _nine);
 
+/// Whether an unquoted identifier can start with [c].
+bool _isNameStart(int c) =>
+    c == _underscore ||
+    (c >= _lowerA && c <= _lowerZ) ||
+    (c >= _upperA && c <= _upperZ);
+
 bool _isSpace(int c) => c == _space || c == _tab || c == _lf || c == _cr;
 
 /// The index just past the single-quoted literal starting at [i].
@@ -74,14 +80,17 @@ int skipQuoted(String sql, int i) {
   return j;
 }
 
-/// Whether the `$` at [i] opens a dollar-quoted body.
+/// The index just past the unquoted identifier starting at [i], read as the
+/// lexer reads one: `[A-Za-z_][A-Za-z0-9_$]*`.
 ///
-/// A `$` is legal inside an unquoted identifier, so `A$$B` is a name rather
-/// than the start of a body: a real delimiter is never preceded by an
-/// identifier character.
-bool opensDollarQuote(String sql, int i) {
-  if (i + 1 >= sql.length || sql.codeUnitAt(i + 1) != _dollar) return false;
-  return i == 0 || !isWordChar(sql.codeUnitAt(i - 1));
+/// A `$` is legal inside an unquoted identifier, so `A$$B` is one name rather
+/// than a name and the start of a body.
+int skipName(String sql, int i) {
+  var j = i + 1;
+  while (j < sql.length && isWordChar(sql.codeUnitAt(j))) {
+    j++;
+  }
+  return j;
 }
 
 /// The index just past the `$$...$$` body starting at [i].
@@ -93,10 +102,20 @@ int skipDollarQuoted(String sql, int i) {
   return stop < 0 ? sql.length : stop + 2;
 }
 
-/// The index just past the line comment starting at [i].
+/// The index just past the line comment starting at [i] and the line end that
+/// closes it.
+///
+/// The comment ends at a line feed or a carriage return, whichever comes
+/// first, as the lexer's `('--' | '//') ~[\r\n]*` does: a lone carriage return
+/// ends it too.
 int skipLine(String sql, int i) {
-  final stop = sql.indexOf('\n', i);
-  return stop < 0 ? sql.length : stop + 1;
+  var j = i;
+  while (j < sql.length) {
+    final c = sql.codeUnitAt(j);
+    if (c == _lf || c == _cr) return j + 1;
+    j++;
+  }
+  return sql.length;
 }
 
 /// The index just past the block comment starting at [i].
@@ -105,19 +124,25 @@ int skipBlockComment(String sql, int i) {
   return stop < 0 ? sql.length : stop + 2;
 }
 
-/// Whether a comment or a quoted region opens at [i], and where it ends.
+/// Whether a comment, a quoted region or a name opens at [i], and where it
+/// ends.
 ///
-/// Returns the index just past the region, or `-1` when [i] does not open one.
-/// Every walk over a statement starts here, so none of them can forget a case.
+/// Returns the index just past it, or `-1` when [i] does not open one. Every
+/// walk over a statement starts here, so none of them can forget a case.
 int skipEnclosure(String sql, int i) {
   final c = sql.codeUnitAt(i);
+  // A name is read whole, as the lexer reads one, so a `$` inside it — the
+  // `$$` in `A$$B` — opens no dollar-quoted body.
+  if (_isNameStart(c)) return skipName(sql, i);
   switch (c) {
     case _apostrophe:
       return skipString(sql, i);
     case _doubleQuote:
       return skipQuoted(sql, i);
     case _dollar:
-      return opensDollarQuote(sql, i) ? skipDollarQuoted(sql, i) : -1;
+      return i + 1 < sql.length && sql.codeUnitAt(i + 1) == _dollar
+          ? skipDollarQuoted(sql, i)
+          : -1;
     case _minus:
       if (i + 1 < sql.length && sql.codeUnitAt(i + 1) == _minus) {
         return skipLine(sql, i);

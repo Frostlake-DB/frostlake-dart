@@ -1,5 +1,5 @@
 name: frostlake
-version: 0.2.0
+version: 0.2.1
 description: >-
   Zero-dependency Dart driver for the Frostlake SQL engine, speaking its HTTP
   protocol against a running DatabaseHttpServer.

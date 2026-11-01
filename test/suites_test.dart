@@ -149,15 +149,40 @@ Future<void> _runCase(Connection conn, Map<String, Object?> entry) async {
   }
 }
 
+/// The role each suite's session opened with (empty when it had none), read on
+/// the suite's first case.
+final _openingRoles = Expando<String>('opening role');
+
 /// The reset sequence SCHEMA.md prescribes: every case starts in an empty
-/// `test_db.test_schema`.
+/// `test_db.test_schema`, under the role its session opened with. A suite's
+/// session serves all its cases, so it gets that role back, and no secondary
+/// roles, before each case after the first: a case's `USE ROLE` stays on its
+/// session, and a reset run under another role leaves `test_db` owned by that
+/// role, which the next suite's session cannot replace.
 Future<void> _resetContext(Connection conn) async {
-  for (final sql in const [
+  final opening = _openingRoles[conn];
+  final statements = <String>[];
+  if (opening == null) {
+    const probe = 'SELECT CURRENT_ROLE()';
+    final outcome = await _run(conn, probe);
+    if (outcome.error != null) {
+      fail('resetContext failed on "$probe": ${outcome.error}');
+    }
+    _openingRoles[conn] = outcome.rows.isEmpty || outcome.rows.first.isEmpty
+        ? ''
+        : (outcome.rows.first.first ?? '');
+  } else if (opening.isNotEmpty) {
+    statements
+      ..add('USE ROLE "${opening.replaceAll('"', '""')}"')
+      ..add('USE SECONDARY ROLES NONE');
+  }
+  statements.addAll(const [
     'CREATE OR REPLACE DATABASE test_db',
     'USE DATABASE test_db',
     'CREATE OR REPLACE SCHEMA test_schema',
     'USE SCHEMA test_schema',
-  ]) {
+  ]);
+  for (final sql in statements) {
     final outcome = await _run(conn, sql);
     if (outcome.error != null) {
       fail('resetContext failed on "$sql": ${outcome.error}');

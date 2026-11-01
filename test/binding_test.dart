@@ -50,12 +50,34 @@ void main() {
           r'SELECT A$$B FROM t WHERE x = 1');
     });
 
+    test('a name is read whole, so only dollars outside one open a body', () {
+      expect(substitutePositional(r'SELECT 1 AS a$$b, ?', [7]),
+          r'SELECT 1 AS a$$b, 7');
+      expect(
+          substitutePositional(r'SELECT a$$b, ? FROM t$$ WHERE c$ = ?', [7, 8]),
+          r'SELECT a$$b, 7 FROM t$$ WHERE c$ = 8');
+      // A $$ right after a number or a positional reference does open one.
+      expect(
+          substitutePositional(r'SELECT 1$$?$$, ?', [7]), r'SELECT 1$$?$$, 7');
+      expect(substitutePositional(r'SELECT $1$$?$$, ?', [7]),
+          r'SELECT $1$$?$$, 7');
+    });
+
     test('a ? inside a comment is not a placeholder', () {
       expect(substitutePositional('SELECT 1 -- ?\n, ?', [2]),
           'SELECT 1 -- ?\n, 2');
       expect(substitutePositional('SELECT 1 // ?\n, ?', [2]),
           'SELECT 1 // ?\n, 2');
       expect(substitutePositional('SELECT /* ? */ ?', [3]), 'SELECT /* ? */ 3');
+    });
+
+    test('a line comment ends at a carriage return as well as a line feed', () {
+      expect(substitutePositional('SELECT 1 -- c\r, ?', [7]),
+          'SELECT 1 -- c\r, 7');
+      expect(substitutePositional('SELECT 1 // c?\r\n, ?', [7]),
+          'SELECT 1 // c?\r\n, 7');
+      expect(substitutePositional('SELECT 1 -- c?\n, ?', [7]),
+          'SELECT 1 -- c?\n, 7');
     });
   });
 
@@ -191,6 +213,22 @@ void main() {
       expect(substitutePositional('SELECT 3-?', [5]), 'SELECT 3-5');
     });
 
+    test('keeps a negative one value wherever it lands', () {
+      // Bare, ?::VARCHAR would cast before it negates.
+      expect(substitutePositional('SELECT ?::VARCHAR', [-5]),
+          'SELECT (-5)::VARCHAR');
+      expect(substitutePositional('SELECT 3-?, ?::VARCHAR', [-2.5, -2.5]),
+          'SELECT 3-(-2.5), (-2.5)::VARCHAR');
+      expect(
+          substitutePositional(
+              'SELECT 3-?', [BigInt.parse('-123456789012345678901234567890')]),
+          'SELECT 3-(-123456789012345678901234567890)');
+      // Negative zero is not below zero, but it is written with a minus.
+      expect(formatLiteral(-0.0), '(-0.0)');
+      expect(substitutePositional('SELECT 3-?', [-0.0]), 'SELECT 3-(-0.0)');
+      expect(formatLiteral([-1, 2]), '[(-1), 2]');
+    });
+
     test('refuses a timestamp year outside the calendar', () {
       expect(() => formatLiteral(DateTime.utc(-1, 1, 1)),
           throwsA(isA<UsageException>()));
@@ -256,6 +294,27 @@ void main() {
       expect(splitStatements(r'CREATE FUNCTION f() AS $$ a; b $$'),
           [r'CREATE FUNCTION f() AS $$ a; b $$']);
       expect(splitStatements('SELECT 1 -- ;\n'), ['SELECT 1 -- ;\n']);
+    });
+
+    test('ends a line comment at a carriage return as well as a line feed', () {
+      expect(splitStatements('SELECT 1 -- a\r; SELECT 2'),
+          ['SELECT 1 -- a\r', ' SELECT 2']);
+      expect(splitStatements('SELECT 1 // a\r; SELECT 2'),
+          ['SELECT 1 // a\r', ' SELECT 2']);
+      expect(changesSessionScope('SELECT 1 -- c\r; USE DATABASE db'), isTrue);
+      expect(leadingWords('-- c\rUSE DATABASE d', 2), ['USE', 'DATABASE']);
+      expect(touchesSession('-- c\rCREATE TEMP TABLE t (a INT)'), isTrue);
+      expect(transactionEffect('-- c\rBEGIN'), TransactionEffect.begins);
+    });
+
+    test('reads a name whole, so only dollars outside one open a body', () {
+      expect(splitStatements(r'SELECT A$$B; SELECT 2'),
+          [r'SELECT A$$B', ' SELECT 2']);
+      // A $$ right after a number or a closed body does open one.
+      expect(splitStatements(r'SELECT 1$$;$$; SELECT 2'),
+          [r'SELECT 1$$;$$', ' SELECT 2']);
+      expect(splitStatements(r'SELECT $$a$$$$;$$; SELECT 2'),
+          [r'SELECT $$a$$$$;$$', ' SELECT 2']);
     });
 
     test('spots the statements that move a session', () {
